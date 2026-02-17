@@ -58,24 +58,27 @@ Separé el código para mantener el core simple, testeable y con infraestructura
 
 ```mermaid
 flowchart TD
-  A[HTTP Request] --> B[RateLimiterFilter<br/>(OncePerRequestFilter)]
-  B --> C[RequestIdentityExtractor<br/>apiKey / ip]
-  C --> D[RateLimiterEngine.evaluate]
-  D --> E[PolicyResolver.resolve(pathPattern)]
-  E --> F{Policies empty?}
-  F -- Yes --> Z[Continue chain → Controller]
-  F -- No --> G[For each policy]
-  G --> H[TokenBucketStore.tryConsume(bucketKey, cap, refill, cost)]
+  A["HTTP Request"] --> B["RateLimiterFilter<br>OncePerRequestFilter"]
+  B --> C["RequestIdentityExtractor<br>apiKey / ip"]
+  C --> D["RateLimiterEngine.evaluate"]
+  D --> E["PolicyResolver.resolve(pathPattern)"]
+  E --> F{"Policies empty?"}
 
-  H --> I{Store}
-  I -- InMemory --> J[CHM get/create BucketState<br/>lock per key<br/>refill + consume]
-  I -- Redis --> K[EVAL Lua in Redis (atomic)<br/>HMGET → refill → consume → HMSET + PEXPIRE]
+  F -->|Yes| Z["Continue filter chain<br>Controller"]
+  F -->|No| G["For each policy"]
+  G --> H["TokenBucketStore.tryConsume(bucketKey, cap, refill, cost)"]
 
-  J --> L[Decision per policy]
+  H --> I{"Store"}
+  I -->|InMemory| J["ConcurrentHashMap get/create BucketState<br>Lock per key<br>Refill + Consume"]
+  I -->|Redis| K["Redis EVAL Lua (atomic)<br>HMGET -> refill -> consume -> HMSET + PEXPIRE"]
+
+  J --> L["Decision per policy"]
   K --> L
-  L --> M{Any DENY?}
-  M -- Yes --> N[429 + Retry-After<br/>RateLimit-* headers]
-  M -- No --> Z
+
+  L --> M{"Any DENY?"}
+  M -->|Yes| N["Return 429 Too Many Requests<br>Retry-After + RateLimit-* headers"]
+  M -->|No| Z
+
 ```
 
 ---
@@ -251,6 +254,56 @@ Podría usar `Instant.now()`/`System.currentTimeMillis()`, pero abstraigo `Clock
 En tests uso un `TestClock` que puedo avanzar manualmente.
 
 ---
+## Concurrencia y ejecución en múltiples instancias (distributed behavior)
+
+### Problema
+
+En un despliegue típico hay **múltiples instancias** del servicio detrás de un load balancer. Si el rate limiter guarda estado **en memoria local**, el límite deja de ser global:
+
+* Objetivo: `100 req/min` por `apiKey`
+* Con 10 instancias y limiter in-memory: se puede permitir ~`100 req/min` **por instancia** (≈ `1000 req/min` total), porque cada pod tiene su propio bucket/contador.
+
+### Decisión
+
+Para soportar límites globales en modo distribuido, guardo el estado del bucket en un store compartido (**Redis**) y hago el update de forma **atómica** usando un script **Lua**.
+
+### Por qué hace falta atomicidad
+
+El update del token bucket es una operación **read–modify–write**:
+
+1. leer `tokens` y `ts`
+2. calcular refill por `delta`
+3. decidir allow/deny
+4. persistir nuevo estado
+
+Si hago esos pasos con múltiples comandos desde la aplicación, dos instancias pueden leer el mismo estado en paralelo y permitir de más (“double allow”). Con Lua, Redis ejecuta todo el script como una sola unidad sin interleaving, eliminando esa condición de carrera.
+
+#### Ejemplo (2 instancias, misma apiKey)
+
+Config:
+
+* `capacity=1`, `refill=0`, `cost=1`
+* bucketKey: `rl:global:API_KEY:abc` con `tokens=1`
+
+**Sin Lua (GET/SET separados):**
+
+* Pod A lee `tokens=1` → decide ALLOW
+* Pod B lee `tokens=1` → decide ALLOW
+* Ambos escriben `tokens=0`
+  Resultado: se permiten **2** requests con capacidad **1**.
+
+**Con Lua (EVAL atómico):**
+
+* Pod A ejecuta script → ve `tokens=1` → ALLOW → guarda `tokens=0`
+* Pod B ejecuta script después → ve `tokens=0` → DENY
+  Resultado: se permite **1** request y se rechaza el resto correctamente.
+
+### Comportamiento esperado
+
+* **IN_MEMORY**: correcto en single instance; no garantiza límite global en múltiples instancias.
+* **REDIS**: consistente por `bucketKey` a través de todas las instancias (misma key → misma cuota).
+
+---
 
 ## Consideraciones de thread pools (MVC)
 
@@ -271,12 +324,3 @@ En Spring MVC cada request consume un thread. Por eso corto temprano con filter 
 * Integration test con Redis (Testcontainers):
 
     * validar atomicidad real y comportamiento del store
-
----
-
-## Próximos pasos (si hubiera más tiempo)
-
-* Concurrency limiter opcional (bulkhead) para endpoints pesados.
-* Soporte de “planes” por apiKey (resolver rule set por cliente).
-* Usar `TIME` de Redis para evitar drift entre nodos (opcional).
-* Métricas (Micrometer): allowed/denied/degraded/latencia store.
