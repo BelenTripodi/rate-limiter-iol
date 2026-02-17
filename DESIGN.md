@@ -69,8 +69,8 @@ flowchart TD
   G --> H["TokenBucketStore.tryConsume(bucketKey, cap, refill, cost)"]
 
   H --> I{"Store"}
-  I -->|InMemory| J["ConcurrentHashMap get/create BucketState<br>Lock per key<br>Refill + Consume"]
-  I -->|Redis| K["Redis EVAL Lua (atomic)<br>HMGET -> refill -> consume -> HMSET + PEXPIRE"]
+  I -->|InMemory| J["InMemory store<br>CHM get/create BucketState<br>Lock per key<br>Refill + Consume"]
+  I -->|Redis| K["Redis store<br>EVAL Lua (atomic)<br>HMGET -> refill -> consume -> HMSET + PEXPIRE"]
 
   J --> L["Decision per policy"]
   K --> L
@@ -78,6 +78,24 @@ flowchart TD
   L --> M{"Any DENY?"}
   M -->|Yes| N["Return 429 Too Many Requests<br>Retry-After + RateLimit-* headers"]
   M -->|No| Z
+
+  %% ===== Colors =====
+  classDef entry fill:#E3F2FD,stroke:#1E88E5,stroke-width:2px,color:#0D47A1;
+  classDef edge fill:#E8F5E9,stroke:#43A047,stroke-width:2px,color:#1B5E20;
+  classDef core fill:#FFF3E0,stroke:#FB8C00,stroke-width:2px,color:#E65100;
+  classDef decision fill:#F3E5F5,stroke:#8E24AA,stroke-width:2px,color:#4A148C;
+  classDef store fill:#E0F7FA,stroke:#00ACC1,stroke-width:2px,color:#006064;
+  classDef ok fill:#E8F5E9,stroke:#2E7D32,stroke-width:2px,color:#1B5E20;
+  classDef deny fill:#FFEBEE,stroke:#E53935,stroke-width:2px,color:#B71C1C;
+
+  class A entry;
+  class B,C edge;
+  class D,E,G,H,L core;
+  class F,I,M decision;
+  class J,K store;
+  class Z ok;
+  class N deny;
+
 
 ```
 
