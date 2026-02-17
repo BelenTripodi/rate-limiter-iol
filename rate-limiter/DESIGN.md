@@ -1,0 +1,282 @@
+# Rate Limiter — Decisiones de diseño
+
+## Objetivo del problema
+
+Construí un **Rate Limiter** que, para cada request HTTP, decide **ALLOW / DENY** para:
+
+* prevenir abuso y picos,
+* proteger recursos finitos (threads, CPU, DB, downstreams),
+* ser correcto bajo **concurrencia** y en **escenarios distribuidos**,
+* mantener **baja latencia** (está en el camino crítico de cada request),
+* ser configurable y testeable.
+
+## Contexto tecnológico elegido
+
+* **Kotlin + Spring Boot MVC** (servlet / thread-per-request).
+* Implementé rate limiting como un **componente transversal** al negocio (cross-cutting).
+
+---
+
+## Arquitectura por capas (estructura del repo)
+
+Separé el código para mantener el core simple, testeable y con infraestructura intercambiable:
+
+* **web/**
+
+    * `RateLimiterFilter` (filtro servlet)
+    * extracción de identidad: `RequestIdentityExtractor`
+    * DTOs de error y headers HTTP
+* **application/**
+
+    * `RateLimiterEngine`: orquesta evaluación de policies y combina decisiones
+    * `PolicyResolver`: elige qué reglas aplican por path
+    * `RequestIdentityContext`: selecciona identidad según estrategia
+* **domain/**
+
+    * modelos (`Policy`, `RateLimitDecision`, etc.)
+    * `TokenBucketStore` (puerto/interfaz)
+    * `Clock` (abstracción de tiempo)
+* **infrastructure/**
+
+    * `InMemoryTokenBucketStore` (implementación local, thread-safe)
+    * `RedisTokenBucketStore` + `RedisScripts` (implementación distribuida)
+    * wiring de beans (`BeansConfig`)
+
+---
+
+## Flujo de una request (high level)
+
+1. Llega request al server (Tomcat/Jetty).
+2. `RateLimiterFilter` intercepta temprano.
+3. Extraigo identidades (API key / IP).
+4. `RateLimiterEngine` resuelve policies aplicables por `pathPattern`.
+5. Por cada policy: consumo tokens del bucket correspondiente (InMemory o Redis).
+6. Si alguna policy deniega → respondo **429** + headers.
+7. Si todas permiten → continúo cadena de filtros → controller.
+
+### Diagrama (Mermaid)
+
+```mermaid
+flowchart TD
+  A[HTTP Request] --> B[RateLimiterFilter<br/>(OncePerRequestFilter)]
+  B --> C[RequestIdentityExtractor<br/>apiKey / ip]
+  C --> D[RateLimiterEngine.evaluate]
+  D --> E[PolicyResolver.resolve(pathPattern)]
+  E --> F{Policies empty?}
+  F -- Yes --> Z[Continue chain → Controller]
+  F -- No --> G[For each policy]
+  G --> H[TokenBucketStore.tryConsume(bucketKey, cap, refill, cost)]
+
+  H --> I{Store}
+  I -- InMemory --> J[CHM get/create BucketState<br/>lock per key<br/>refill + consume]
+  I -- Redis --> K[EVAL Lua in Redis (atomic)<br/>HMGET → refill → consume → HMSET + PEXPIRE]
+
+  J --> L[Decision per policy]
+  K --> L
+  L --> M{Any DENY?}
+  M -- Yes --> N[429 + Retry-After<br/>RateLimit-* headers]
+  M -- No --> Z
+```
+
+---
+
+## Decisión clave: dónde ubicar el rate limiter
+
+### Elegí `OncePerRequestFilter`
+
+**Por qué:**
+
+* Es el punto más “de borde” en Spring MVC → corto temprano y protejo mejor el **thread pool**.
+* Se ejecuta **una sola vez por request** (evito dobles ejecuciones en forwards/includes).
+* No acoplo la lógica a controllers (queda más limpio que AOP/anotaciones para este challenge).
+* Puedo devolver 429 de forma consistente desde el mismo lugar.
+
+**Alternativas consideradas:**
+
+* `HandlerInterceptor`: válido, pero corre más “adentro” (ya resolvió handler mapping).
+* AOP: útil para concerns por método/anotación, pero suele correr tarde y tiene trampas (self-invocation).
+
+---
+
+## Modelo de reglas (Policies)
+
+Una **policy** representa una regla configurable:
+
+* `name`: identifica la regla (también participa en la key del bucket).
+* `pathPattern`: matchea rutas (AntPathMatcher).
+* `keyStrategy`: define la identidad de la cuota (`API_KEY` o `IP`).
+* `capacity`: tokens máximos acumulables (burst permitido).
+* `refillTokensPerSecond`: tasa de recarga (promedio).
+* `cost`: costo por request (permite “requests más caras”).
+
+Esto me permite aplicar varias reglas a la misma request (por ejemplo, global + endpoint-specific).
+
+---
+
+## Identidad: por qué uso API key (y IP como alternativa)
+
+* `API_KEY` me da fairness por cliente y suele ser más estable que IP.
+* IP es útil como fallback o para endpoints públicos, aunque puede ser compartida (NAT/proxy) y cambiar.
+
+Implementación:
+
+* API key: header `X-Api-Key` (si falta, puedo tratarlo como “anonymous” o decidir por policy).
+* IP: `X-Forwarded-For` (primer valor) o `remoteAddr`.
+
+---
+
+## Algoritmo elegido: Token Bucket
+
+Elegí **Token Bucket** porque:
+
+* permite bursts controlados (`capacity`) sin romper el promedio (`refill`),
+* es estándar en industria,
+* es fácil de explicar y testear,
+* evita el “edge burst” típico de fixed window.
+
+### Refill “lazy”
+
+No uso un job de recarga. Calculo el refill **cuando llega una request** (en `tryConsume`):
+
+* `delta = now - lastRefill`
+* `tokens = min(capacity, tokens + delta * refillRate)`
+* luego intento consumir `cost`.
+
+---
+
+## Store intercambiable (puerto)
+
+`TokenBucketStore` define la operación crítica:
+
+* `tryConsume(key, capacity, refillTokensPerSecond, cost) -> Allowed/Deny`
+
+Esto me permite cambiar la implementación sin tocar el core:
+
+* **IN_MEMORY** (dev/tests, simple)
+* **REDIS** (correctitud distribuida)
+
+---
+
+## InMemory: por qué `ConcurrentHashMap` + `ReentrantLock`
+
+Hay dos problemas de concurrencia distintos:
+
+1. **Acceso al mapa de buckets**
+
+    * Uso `ConcurrentHashMap` y `computeIfAbsent` para obtener/crear `BucketState` por key sin carreras.
+2. **Operación read-modify-write del bucket**
+
+    * Uso un lock **por bucket** (`ReentrantLock`) para que refill + consumo sea atómico por key y no se permitan requests de más.
+
+Elegí lock por key para reducir contención comparado con un lock global.
+
+---
+
+## Redis: cómo funciona y por qué Redis
+
+### Por qué elijo Redis (vs otra NoSQL)
+
+* Latencia muy baja (in-memory) y alto throughput para estado pequeño por request.
+* TTL nativo para limpieza automática de buckets.
+* Atomicidad simple y robusta con **Lua** (read-modify-write sin races entre pods).
+
+### Atomicidad con Lua
+
+Ejecuto un script con `EVAL` que hace:
+
+* `HMGET` tokens + ts
+* calcula refill y aplica cap
+* decide allow/deny y descuenta
+* `HMSET` tokens + ts
+* `PEXPIRE` TTL
+* devuelve `{allowed, tokens, retryAfterMs}`
+
+Redis ejecuta el script como una única unidad sin interleaving con otros comandos, por lo que no hay race conditions para una misma key.
+
+### Modelo guardado en Redis
+
+Guardo el mínimo necesario:
+
+* Hash:
+
+    * `tokens` (Double)
+    * `ts` (ms)
+* TTL por key (limpieza)
+
+`tokens` mantiene el saldo; `ts` permite calcular `delta` para refill; TTL evita crecimiento infinito.
+
+### TTL dinámico
+
+Calculo TTL en función de “tiempo para recargar a full”:
+
+* si `refill <= 0`: TTL fijo grande (ej 1h)
+* si `refill > 0`: TTL ≈ `2 * secondsToFull` con mínimo (ej 1 min)
+
+---
+
+## Failure modes: FAIL_OPEN vs FAIL_CLOSED
+
+Si falla el store (Redis caído/timeout), aplico una estrategia configurable:
+
+* **FAIL_OPEN**: permito y marco `degraded=true`
+  (más disponibilidad, menos protección)
+* **FAIL_CLOSED**: bloqueo y marco `degraded=true`
+  (más protección, riesgo de bloquear tráfico legítimo)
+
+---
+
+## Headers HTTP y debug controlado
+
+### Headers principales
+
+* `RateLimit-Limit`
+* `RateLimit-Remaining`
+* `RateLimit-Reset` (cuando aplica)
+* `Retry-After` (solo en 429)
+
+### Debug headers (opcional)
+
+Solo los habilito si el cliente lo pide explícitamente (ej. `Debug: true`) y bajo una condición adicional (ej. `Client` no vacío) para no filtrar internals por defecto.
+
+---
+
+## Tiempo: por qué abstraigo `Clock`
+
+Podría usar `Instant.now()`/`System.currentTimeMillis()`, pero abstraigo `Clock` para:
+
+* tests determinísticos sin sleeps,
+* control de escenarios de delta-tiempo,
+* evitar flakiness.
+
+En tests uso un `TestClock` que puedo avanzar manualmente.
+
+---
+
+## Consideraciones de thread pools (MVC)
+
+En Spring MVC cada request consume un thread. Por eso corto temprano con filter para evitar trabajo innecesario y prevenir colas grandes. Si tuviera más tiempo, sumaría un **concurrency limiter** (semaphore/bulkhead) para proteger pools de DB/downstreams cuando la latencia sube.
+
+---
+
+## Estrategia de testing
+
+* Unit tests del core:
+
+    * refill, cap, consume, retryAfter
+    * resolver de policies por pathPattern
+    * engine combinando múltiples policies
+* Tests de concurrencia (InMemory):
+
+    * asegurar que no se “pasan” tokens bajo race
+* Integration test con Redis (Testcontainers):
+
+    * validar atomicidad real y comportamiento del store
+
+---
+
+## Próximos pasos (si hubiera más tiempo)
+
+* Concurrency limiter opcional (bulkhead) para endpoints pesados.
+* Soporte de “planes” por apiKey (resolver rule set por cliente).
+* Usar `TIME` de Redis para evitar drift entre nodos (opcional).
+* Métricas (Micrometer): allowed/denied/degraded/latencia store.
