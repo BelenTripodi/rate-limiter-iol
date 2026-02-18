@@ -6,7 +6,7 @@ Servicio de ejemplo que aplica **rate limiting por request** (ALLOW/DENY) con al
 * Redis: consistencia distribuida con **Lua** (update atómico del bucket)
 * Tests: Kotest + MockK + Testcontainers (Redis)
 
-> Decisiones de diseño y trade-offs: ver **DESIGN.md**
+> Decisiones de diseño y trade-offs: ver **[DESIGN.md](/DESIGN.md)**
 
 ---
 
