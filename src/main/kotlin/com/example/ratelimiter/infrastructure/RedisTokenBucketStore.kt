@@ -7,6 +7,7 @@ import com.example.ratelimiter.domain.RateLimitDecisionDenied
 import com.example.ratelimiter.domain.TokenBucketStore
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.data.redis.core.script.DefaultRedisScript
+import org.slf4j.LoggerFactory
 import java.time.Duration
 import kotlin.math.ceil
 
@@ -16,6 +17,8 @@ class RedisTokenBucketStore(
   private val redis: StringRedisTemplate,
   private val clock: Clock
 ) : TokenBucketStore {
+
+  private val log = LoggerFactory.getLogger(javaClass)
 
   private val script = DefaultRedisScript<List<Any>>().apply {
     setScriptText(RedisScripts.TOKEN_BUCKET_LUA)
@@ -49,6 +52,7 @@ class RedisTokenBucketStore(
       val retryAfterMs =
         if (result.retryAfterMs >= 0) result.retryAfterMs
         else Long.MAX_VALUE
+      log.info("Rate limit denied (redis). policy={} retryAfterMs={}", policyName(key), retryAfterMs)
       RateLimitDecisionDenied(retryAfterMs = retryAfterMs)
     }
   }
@@ -69,4 +73,7 @@ class RedisTokenBucketStore(
     val ttlMs = ceil(secondsToFull * 2 * 1000.0).toLong()
     return maxOf(minTtlMs, ttlMs)
   }
+
+  private fun policyName(key: String): String =
+    key.substringBefore(":")
 }

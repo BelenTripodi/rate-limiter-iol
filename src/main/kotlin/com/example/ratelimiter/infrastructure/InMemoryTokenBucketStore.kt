@@ -5,6 +5,7 @@ import com.example.ratelimiter.domain.RateLimitDecision
 import com.example.ratelimiter.domain.RateLimitDecisionAllowed
 import com.example.ratelimiter.domain.RateLimitDecisionDenied
 import com.example.ratelimiter.domain.TokenBucketStore
+import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.ceil
 import kotlin.math.max
@@ -16,6 +17,8 @@ import kotlin.math.min
  * Each key has its own lock to reduce contention under concurrency.
  */
 class InMemoryTokenBucketStore(private val clock: Clock) : TokenBucketStore {
+
+  private val log = LoggerFactory.getLogger(javaClass)
 
   private val buckets = ConcurrentHashMap<String, BucketState>()
 
@@ -48,10 +51,14 @@ class InMemoryTokenBucketStore(private val clock: Clock) : TokenBucketStore {
         val retryAfterMs =
           if (refillPerMs > 0) ceil((cost - state.tokens) / refillPerMs).toLong()
           else Long.MAX_VALUE
+        log.info("Rate limit denied (in-memory). policy={} retryAfterMs={}", policyName(key), retryAfterMs)
         RateLimitDecisionDenied(retryAfterMs = retryAfterMs)
       }
     } finally {
       state.lock.unlock()
     }
   }
+
+  private fun policyName(key: String): String =
+    key.substringBefore(":")
 }

@@ -104,14 +104,4 @@ spring:
 * `domain/`: modelos + interfaces (store, clock)
 * `infrastructure/`: InMemory store + Redis store (Lua)
 
----
-
-## Challenge notes
-
-Implementa el ejercicio “Rate Limiter” (Alex Xu, *System Design Interview*). Se prioriza:
-
-* build verde,
-* tests del core,
-* código simple y mantenible.
-
 

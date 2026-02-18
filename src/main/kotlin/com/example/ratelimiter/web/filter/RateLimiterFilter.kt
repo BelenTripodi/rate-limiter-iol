@@ -29,6 +29,7 @@ class RateLimiterFilter(
     response: HttpServletResponse,
     filterChain: FilterChain
   ) {
+    log.info("Rate limit check start. method={} path={}", request.method, request.requestURI)
     val identities = RequestIdentityContext(
       apiKey = RequestIdentityExtractor.apiKey(request),
       ip = RequestIdentityExtractor.ip(request)
@@ -55,6 +56,11 @@ class RateLimiterFilter(
     result: EvaluationAllowed,
     onContinue: () -> Unit
   ) {
+    if (result.degraded) {
+      log.warn("Rate limiting degraded (allow). method={} path={}", request.method, request.requestURI)
+    } else {
+      log.info("Rate limiting allowed. method={} path={}", request.method, request.requestURI)
+    }
     response.takeIf { !it.isCommitted }?.let { servletResponse ->
       setRateLimitHeaders(
         response = servletResponse,
@@ -79,6 +85,21 @@ class RateLimiterFilter(
     response: HttpServletResponse,
     result: EvaluationDenied
   ) {
+    if (result.degraded) {
+      log.warn(
+        "Rate limiting degraded (deny). method={} path={} retryAfterMs={}",
+        request.method,
+        request.requestURI,
+        result.retryAfterMs
+      )
+    } else {
+      log.info(
+        "Rate limiting denied. method={} path={} retryAfterMs={}",
+        request.method,
+        request.requestURI,
+        result.retryAfterMs
+      )
+    }
     response.takeIf { !it.isCommitted }?.let { servletResponse ->
       val retryAfterSeconds = maxOf(1L, ceil(result.retryAfterMs / 1000.0).toLong())
       servletResponse.status = 429

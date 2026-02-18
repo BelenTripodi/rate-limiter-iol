@@ -1,7 +1,6 @@
 package com.example.ratelimiter.application
 
 import com.example.ratelimiter.config.RateLimiterFailStrategy
-import com.example.ratelimiter.domain.RateLimitDecision
 import com.example.ratelimiter.domain.RateLimitDecisionAllowed
 import com.example.ratelimiter.domain.RateLimitDecisionDenied
 import com.example.ratelimiter.domain.TokenBucketStore
@@ -19,6 +18,7 @@ class RateLimiterEngine(
     val path = request.requestURI ?: "/"
     val policies = resolver.resolve(path)
     if (policies.isEmpty()) {
+      log.info("Rate limiter skipped (no policies). path={}", path)
       return EvaluationAllowed(
         remainingTokens = Long.MAX_VALUE,
         limit = Long.MAX_VALUE,
@@ -26,11 +26,14 @@ class RateLimiterEngine(
       )
     }
 
+    log.info("Rate limiter evaluate. path={} policies={}", path, policies.joinToString(",") { it.name })
+
     var minRemaining = Long.MAX_VALUE
     var maxRetryAfterMs = 0L
     var minCapacity = Long.MAX_VALUE
     var minRefillPerSecond = Double.MAX_VALUE
 
+    val deniedPolicies = mutableListOf<String>()
     try {
       policies.forEach { policy ->
         minCapacity = minOf(minCapacity, policy.capacity)
@@ -39,7 +42,10 @@ class RateLimiterEngine(
         val bucketKey = bucketKey(policy.name, identity)
         when (val decision = store.tryConsume(bucketKey, policy.capacity, policy.refillTokensPerSecond, policy.cost)) {
           is RateLimitDecisionAllowed -> minRemaining = minOf(minRemaining, decision.remainingTokens)
-          is RateLimitDecisionDenied -> maxRetryAfterMs = maxOf(maxRetryAfterMs, decision.retryAfterMs)
+          is RateLimitDecisionDenied -> {
+            maxRetryAfterMs = maxOf(maxRetryAfterMs, decision.retryAfterMs)
+            deniedPolicies.add("${policy.name}:${identity.type}:${maskIdentityValue(identity.value)}")
+          }
         }
       }
     } catch (e: Exception) {
@@ -63,12 +69,27 @@ class RateLimiterEngine(
     }
 
     return if (maxRetryAfterMs > 0) {
+      log.info(
+        "Rate limit denied. path={} policiesDenied={} retryAfterMs={} limit={} refillPerSecond={}",
+        path,
+        deniedPolicies.joinToString(","),
+        maxRetryAfterMs,
+        minCapacity,
+        minRefillPerSecond
+      )
       EvaluationDenied(
         retryAfterMs = maxRetryAfterMs,
         limit = minCapacity,
         refillTokensPerSecond = minRefillPerSecond
       )
     } else {
+      log.info(
+        "Rate limit allowed. path={} remaining={} limit={} refillPerSecond={}",
+        path,
+        minRemaining,
+        minCapacity,
+        minRefillPerSecond
+      )
       EvaluationAllowed(
         remainingTokens = minRemaining,
         limit = minCapacity,
@@ -79,5 +100,13 @@ class RateLimiterEngine(
 
   private fun bucketKey(ruleName: String, identity: RequestIdentity): String =
     "$ruleName:${identity.type}:${identity.value}"
+
+  private fun maskIdentityValue(value: String): String {
+    if (value.isBlank()) return "unknown"
+    if (value.length <= 4) return "****"
+    val prefix = value.take(2)
+    val suffix = value.takeLast(2)
+    return "$prefix***$suffix"
+  }
 
 }

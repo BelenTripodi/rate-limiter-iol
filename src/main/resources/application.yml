@@ -11,14 +11,14 @@ spring:
 
 ratelimiter:
   mode: REDIS # switch to REDIS when Redis is running
-  failStrategy: FAIL_CLOSED # FAIL_OPEN or FAIL_CLOSED
+  failStrategy: FAIL_OPEN # FAIL_OPEN or FAIL_CLOSED
   rules:
     # Global: 10 requests burst, refills 5 tokens/sec (≈300/min) per API key
     - name: apiKey-global
       pathPattern: "/**"
       keyStrategy: API_KEY
-      capacity: 10
-      refillTokensPerSecond: 5.0
+      capacity: 200
+      refillTokensPerSecond: 150
       cost: 1
 
     # Example stricter rule for a heavy endpoint

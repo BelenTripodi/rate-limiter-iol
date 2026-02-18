@@ -23,30 +23,30 @@ Separé el código para mantener el core simple, testeable y con infraestructura
 
 * **web/**
 
-    * `RateLimiterFilter` (filtro servlet)
-    * extracción de identidad: `RequestIdentityExtractor`
-    * DTOs de error y headers HTTP
+  * `RateLimiterFilter` (filtro servlet)
+  * extracción de identidad: `RequestIdentityExtractor`
+  * DTOs de error y headers HTTP
 * **application/**
 
-    * `RateLimiterEngine`: orquesta evaluación de policies y combina decisiones
-    * `PolicyResolver`: elige qué reglas aplican por path
-    * `RequestIdentityContext`: selecciona identidad según estrategia
+  * `RateLimiterEngine`: orquesta evaluación de policies y combina decisiones
+  * `PolicyResolver`: elige qué reglas aplican por path
+  * `RequestIdentityContext`: selecciona identidad según estrategia
 * **domain/**
 
-    * modelos (`Policy`, `RateLimitDecision`, etc.)
-    * `TokenBucketStore` (puerto/interfaz)
-    * `Clock` (abstracción de tiempo)
+  * modelos (`Policy`, `RateLimitDecision`, etc.)
+  * `TokenBucketStore` (puerto/interfaz)
+  * `Clock` (abstracción de tiempo)
 * **infrastructure/**
 
-    * `InMemoryTokenBucketStore` (implementación local, thread-safe)
-    * `RedisTokenBucketStore` + `RedisScripts` (implementación distribuida)
-    * wiring de beans (`BeansConfig`)
+  * `InMemoryTokenBucketStore` (implementación local, thread-safe)
+  * `RedisTokenBucketStore` + `RedisScripts` (implementación distribuida)
+  * wiring de beans (`BeansConfig`)
 
 ---
 
 ## Flujo de una request (high level)
 
-1. Llega request al server (Tomcat/Jetty).
+1. Llega la request al **servlet container** (Tomcat en mi caso).
 2. `RateLimiterFilter` intercepta temprano.
 3. Extraigo identidades (API key / IP).
 4. `RateLimiterEngine` resuelve policies aplicables por `pathPattern`.
@@ -95,8 +95,6 @@ flowchart TD
   class J,K store;
   class Z ok;
   class N deny;
-
-
 ```
 
 ---
@@ -114,8 +112,8 @@ flowchart TD
 
 **Alternativas consideradas:**
 
-* `HandlerInterceptor`: válido, pero corre más “adentro” (ya resolvió handler mapping).
-* AOP: útil para concerns por método/anotación, pero suele correr tarde y tiene trampas (self-invocation).
+* `HandlerInterceptor`: es una alternativa válida y permite aplicar lógica dentro del pipeline MVC (con acceso al handler/controller). Preferí un filter porque el interceptor corre más adentro (ya pasó la resolución del handler) y yo quería cortar lo antes posible para ahorrar trabajo y proteger threads en un modelo thread-per-request. Usaría interceptor si necesitara lógica dependiente del handler (por ejemplo, leer anotaciones del método).
+* AOP: permite aplicar rate limiting por método/anotación con un `@Around`, pero suele ejecutarse todavía más tarde (cuando ya estás invocando el controller/service). Además, Spring AOP tiene caveats como `self-invocation` (llamadas internas dentro del mismo bean no pasan por el proxy). Para un rate limiter transversal preferí evitar esos edge cases y mantener el flujo más explícito. Usaría AOP si la prioridad fuera rate limiting “por operación” (granularidad por método) y aceptara el trade-off.
 
 ---
 
@@ -163,9 +161,16 @@ No uso un job de recarga. Calculo el refill **cuando llega una request** (en `tr
 * `tokens = min(capacity, tokens + delta * refillRate)`
 * luego intento consumir `cost`.
 
+**Por qué conviene:**
+
+* evita jobs/timers por bucket (solo computo para keys activas),
+* escala mejor y es más barato,
+* encaja con Redis (estado mínimo + script corto),
+* es fácil de testear con un `Clock` controlado.
+
 ---
 
-## Store intercambiable (puerto)
+## Store intercambiable
 
 `TokenBucketStore` define la operación crítica:
 
@@ -184,10 +189,11 @@ Hay dos problemas de concurrencia distintos:
 
 1. **Acceso al mapa de buckets**
 
-    * Uso `ConcurrentHashMap` y `computeIfAbsent` para obtener/crear `BucketState` por key sin carreras.
+* Uso `ConcurrentHashMap` y `computeIfAbsent` para obtener/crear `BucketState` por key sin carreras.
+
 2. **Operación read-modify-write del bucket**
 
-    * Uso un lock **por bucket** (`ReentrantLock`) para que refill + consumo sea atómico por key y no se permitan requests de más.
+* Uso un lock **por bucket** (`ReentrantLock`) para que refill + consumo sea atómico por key y no se permitan requests de más.
 
 Elegí lock por key para reducir contención comparado con un lock global.
 
@@ -212,7 +218,7 @@ Ejecuto un script con `EVAL` que hace:
 * `PEXPIRE` TTL
 * devuelve `{allowed, tokens, retryAfterMs}`
 
-Redis ejecuta el script como una única unidad sin interleaving con otros comandos, por lo que no hay race conditions para una misma key.
+Redis ejecuta el script como una única unidad sin interleaving con otros comandos, por lo que evita el “double allow” cuando varias instancias compiten por la misma key.
 
 ### Modelo guardado en Redis
 
@@ -220,8 +226,8 @@ Guardo el mínimo necesario:
 
 * Hash:
 
-    * `tokens` (Double)
-    * `ts` (ms)
+  * `tokens` (Double)
+  * `ts` (ms)
 * TTL por key (limpieza)
 
 `tokens` mantiene el saldo; `ts` permite calcular `delta` para refill; TTL evita crecimiento infinito.
@@ -237,12 +243,12 @@ Calculo TTL en función de “tiempo para recargar a full”:
 
 ## Failure modes: FAIL_OPEN vs FAIL_CLOSED
 
+El rate limiter está en el camino crítico. Si Redis está caído/lento y no puedo evaluar el bucket a tiempo, igual necesito una decisión rápida para no consumir threads esperando.
+
 Si falla el store (Redis caído/timeout), aplico una estrategia configurable:
 
-* **FAIL_OPEN**: permito y marco `degraded=true`
-  (más disponibilidad, menos protección)
-* **FAIL_CLOSED**: bloqueo y marco `degraded=true`
-  (más protección, riesgo de bloquear tráfico legítimo)
+* **FAIL_OPEN**: permito y marco `degraded=true` (más disponibilidad, menos protección)
+* **FAIL_CLOSED**: bloqueo y marco `degraded=true` (más protección, riesgo de bloquear tráfico legítimo)
 
 ---
 
@@ -272,7 +278,8 @@ Podría usar `Instant.now()`/`System.currentTimeMillis()`, pero abstraigo `Clock
 En tests uso un `TestClock` que puedo avanzar manualmente.
 
 ---
-## Concurrencia y ejecución en múltiples instancias (distributed behavior)
+
+## Concurrencia y ejecución en múltiples instancias
 
 ### Problema
 
@@ -296,49 +303,40 @@ El update del token bucket es una operación **read–modify–write**:
 
 Si hago esos pasos con múltiples comandos desde la aplicación, dos instancias pueden leer el mismo estado en paralelo y permitir de más (“double allow”). Con Lua, Redis ejecuta todo el script como una sola unidad sin interleaving, eliminando esa condición de carrera.
 
-#### Ejemplo (2 instancias, misma apiKey)
-
-Config:
-
-* `capacity=1`, `refill=0`, `cost=1`
-* bucketKey: `rl:global:API_KEY:abc` con `tokens=1`
-
-**Sin Lua (GET/SET separados):**
-
-* Pod A lee `tokens=1` → decide ALLOW
-* Pod B lee `tokens=1` → decide ALLOW
-* Ambos escriben `tokens=0`
-  Resultado: se permiten **2** requests con capacidad **1**.
-
-**Con Lua (EVAL atómico):**
-
-* Pod A ejecuta script → ve `tokens=1` → ALLOW → guarda `tokens=0`
-* Pod B ejecuta script después → ve `tokens=0` → DENY
-  Resultado: se permite **1** request y se rechaza el resto correctamente.
-
-### Comportamiento esperado
-
-* **IN_MEMORY**: correcto en single instance; no garantiza límite global en múltiples instancias.
-* **REDIS**: consistente por `bucketKey` a través de todas las instancias (misma key → misma cuota).
-
----
-
-## Consideraciones de thread pools (MVC)
-
-En Spring MVC cada request consume un thread. Por eso corto temprano con filter para evitar trabajo innecesario y prevenir colas grandes. Si tuviera más tiempo, sumaría un **concurrency limiter** (semaphore/bulkhead) para proteger pools de DB/downstreams cuando la latencia sube.
-
 ---
 
 ## Estrategia de testing
 
 * Unit tests del core:
 
-    * refill, cap, consume, retryAfter
-    * resolver de policies por pathPattern
-    * engine combinando múltiples policies
+  * refill, cap, consume, retryAfter
+  * resolver de policies por pathPattern
+  * engine combinando múltiples policies
 * Tests de concurrencia (InMemory):
 
-    * asegurar que no se “pasan” tokens bajo race
+  * asegurar que no se “pasan” tokens bajo race
 * Integration test con Redis (Testcontainers):
 
-    * validar atomicidad real y comportamiento del store
+  * validar atomicidad real y comportamiento del store
+* (Opcional) Contract tests del script:
+
+  * validar `allowed/remaining/retryAfter` y expiración/TTL del bucket
+  
+---
+
+## Uso de IA
+
+Usé asistencia de IA como apoyo para acelerar el desarrollo y mejorar la calidad del entregable:
+
+* **Documentación:** redacción y refinamiento de `DESIGN.md`/README, diagramas Mermaid y explicación de trade-offs.
+* **Propuestas de diseño:** exploración de alternativas (Filter vs `HandlerInterceptor` vs AOP; token bucket vs fixed/sliding window) y discusión de failure modes (`FAIL_OPEN`/`FAIL_CLOSED`).
+* **Implementación del flujo principal:** scaffolding inicial del flujo (Filter → Engine → Store), estructura por capas y naming.
+* **Tests:** sugerencia de casos de prueba (unit tests del core, tests de concurrencia en in-memory e integración con Redis/Testcontainers).
+
+Validé y ajusté manualmente las decisiones y el código final:
+
+* revisé edge cases (delta negativo, cap, retry-after, atomicidad),
+* agregué/ajusté tests para asegurar correctitud,
+* verifiqué comportamiento en modo `IN_MEMORY` y `REDIS` con oha.
+
+
